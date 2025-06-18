@@ -1,0 +1,410 @@
+//+------------------------------------------------------------------+
+//|                                      Forex trading manipulations |
+//|                                 Copyright 2025, Eduardo Sanjines |
+//|                                   https://github.com/eduardosanj |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//-----------------------------------------------------------------------------
+// Variables globales
+//-----------------------------------------------------------------------------
+input double RiskPercent = 0.25;
+input double RiskRewardRatio = 2.0;
+double  pendingWick     = 0.0;
+datetime lastH1BarTime = 0;
+bool   pendingOrder    = false;
+int    pendingType     = -1;
+double pendingEntry    = 0.0;
+double pendingSL       = 0.0;
+double pendingTP       = 0.0;
+double pendingLots     = 0.0;
+
+//-----------------------------------------------------------------------------
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+// Dispara OnTimer() cada 60 segundos
+   EventSetTimer(60);
+   return(INIT_SUCCEEDED);
+  }
+
+//-----------------------------------------------------------------------------
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+// Detiene el temporizador
+   EventKillTimer();
+  }
+
+
+//-----------------------------------------------------------------------------
+//+------------------------------------------------------------------+
+//| Temporizador: comprueba si ha cerrado la última H1               |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+// Obtiene la hora de cierre de la última H1 completada (shift=1)
+   datetime curH1Time = iTime(_Symbol, PERIOD_H1, 1);
+
+// Si ha cambiado desde la última vez que procesamos, llamamos a CheckH1Candle()
+   if(curH1Time != lastH1BarTime)
+     {
+      lastH1BarTime = curH1Time;
+      CheckH1Candle();
+     }
+  }
+
+
+//+------------------------------------------------------------------+
+//|  Comprueba ÚNICA H1 cerrada que rompió D1 con mecha y va a M5   |
+//+------------------------------------------------------------------+
+void CheckH1Candle()
+  {
+// 1) Máximos/mínimos de las 2 D1 previas (shifts 1 y 2)
+   MqlRates d1[2];
+   if(CopyRates(_Symbol, PERIOD_D1, 1, 2, d1) <= 0)
+     {
+      Print("[ERROR] No se pudieron obtener velas D1");
+      return;
+     }
+   double maxD1 = MathMax(d1[0].high, d1[1].high);
+   double minD1 = MathMin(d1[0].low,  d1[1].low);
+
+// 2) Única H1 cerrada (shift 1)
+   MqlRates h1[1];
+   if(CopyRates(_Symbol, PERIOD_H1, 1, 1, h1) <= 0)
+     {
+      Print("[ERROR] No se pudieron obtener velas H1");
+      return;
+     }
+
+   double o = h1[0].open, c = h1[0].close;
+   double h = h1[0].high,  l = h1[0].low;
+
+// 3) Condiciones de mecha pura:
+//    - Ha roto por arriba pero el cuerpo (la parte sólida) cierra POR DEBAJO del nivel
+   bool wickHigh = (h > maxD1) && (MathMax(o,c) < maxD1);
+//    - Ha roto por abajo pero el cuerpo cierra POR ENCIMA del nivel
+   bool wickLow  = (l < minD1) && (MathMin(o,c) > minD1);
+
+//PrintFormat("[DEBUG] H1 cerrada O=%.5f C=%.5f H=%.5f L=%.5f | maxD1=%.5f minD1=%.5f",
+//o, c, h, l, maxD1, minD1);
+
+// 4) Si detecta mecha en uno de los dos extremos, va directo a M5
+   if(wickHigh || wickLow)
+     {
+      int orderType = wickHigh ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      Print("[DEBUG] Mecha detectada en H1 → entrando a CheckM5Confirmation (",
+            (orderType==ORDER_TYPE_BUY?"BUY":"SELL"), ")");
+      CheckM5ConfirmationFrom(h1[0].time + 3600, orderType);
+     }
+  }
+
+
+
+// Se ejecuta en cada tick
+void OnTick()
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeLocal(), dt);
+
+   static datetime lastH1Check = 0;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentHour = dt.hour;
+
+   TimeToStruct(lastH1Check, dt);
+   int lastHour = dt.hour;
+
+   if(currentHour != lastHour)
+     {
+      lastH1Check = TimeCurrent();
+      CheckH1Candle();
+     }
+  }
+
+
+
+
+
+void CheckM5ConfirmationFrom(datetime fromTime, int orderType)
+{
+    Print("[DEBUG] Iniciando verificación en M5 desde ", TimeToString(fromTime), " para tipo de orden: ", orderType);
+
+    // Obtén hasta 50 velas después del rompimiento (puedes aumentar si quieres buscar más)
+    MqlRates m5Candles[50];
+    int copied = CopyRates(_Symbol, PERIOD_M5, fromTime, 50, m5Candles);
+    if(copied <= 0) {
+        Print("[ERROR] No se pudieron obtener velas M5");
+        return;
+    }
+
+    for(int i = 0; i < copied; i++)
+    {
+        // Ejemplo de confirmación para venta: vela envolvente bajista o martillo bajista
+        double open = m5Candles[i].open;
+        double close = m5Candles[i].close;
+        double high = m5Candles[i].high;
+        double low  = m5Candles[i].low;
+        double body = MathAbs(close - open);
+        double upperWick = high - MathMax(open, close);
+        double lowerWick = MathMin(open, close) - low;
+
+        bool isHammer = upperWick > body * 2;
+        // Si quieres, añade aquí otras condiciones como envolvente, patrón personalizado, etc.
+
+        if(orderType == ORDER_TYPE_SELL && isHammer)
+        {
+            double entryPrice = close;
+            double stopLoss = high;
+            double risk = MathAbs(entryPrice - stopLoss);
+            double takeProfit = entryPrice - risk; // 1:1
+
+            double lots = CalculateLotSize(entryPrice, stopLoss);
+            if(lots <= 0) {
+                Print("[WARN] LotSize calculado <= 0, cancelando orden.");
+                return;
+            }
+
+            // Ejecutar la orden de venta
+            trade.Sell(lots, _Symbol, entryPrice, stopLoss, takeProfit, NULL);
+
+            PrintFormat("[DEBUG:ManualEntry] SELL Entry=%.5f SL=%.5f TP=%.5f Lots=%.2f",
+                        entryPrice, stopLoss, takeProfit, lots);
+            break; // solo toma la primera confirmación
+        }
+        // Si quieres compra, haz el bloque similar para BUY.
+    }
+}
+
+
+
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void CheckM5Confirmation(int orderType)
+  {
+   Print("[DEBUG] Iniciando verificación en M5 para tipo de orden: ", orderType);
+
+   MqlRates m5Candles[10];
+   if(CopyRates(_Symbol, PERIOD_M5, 1, 10, m5Candles) <= 0)
+     {
+      Print("[ERROR] No se pudieron obtener velas M5");
+      return;
+     }
+
+   int selectedIndex = -1;
+   double extremeWick = (orderType == ORDER_TYPE_SELL) ? -DBL_MAX : DBL_MAX;
+
+// Buscar la vela con la mecha más extrema
+   for(int i = 0; i < 9; i++)
+     {
+      double open = m5Candles[i].open;
+      double close = m5Candles[i].close;
+      double high = m5Candles[i].high;
+      double low  = m5Candles[i].low;
+
+      double body = MathAbs(close - open);
+      double upperWick = high - MathMax(open, close);
+      double lowerWick = MathMin(open, close) - low;
+
+      // Para ventas, buscamos la mecha más alta
+      if(orderType == ORDER_TYPE_SELL && high > extremeWick)
+        {
+         extremeWick = high;
+         selectedIndex = i;
+        }
+      // Para compras, buscamos la mecha más baja
+      else
+         if(orderType == ORDER_TYPE_BUY && low < extremeWick)
+           {
+            extremeWick = low;
+            selectedIndex = i;
+           }
+     }
+
+   if(selectedIndex == -1)
+     {
+      Print("[INFO] No se encontró vela dominante con mecha significativa.");
+      return;
+     }
+
+// Verificamos si la vela seleccionada cumple con las condiciones
+   double o = m5Candles[selectedIndex].open;
+   double c = m5Candles[selectedIndex].close;
+   double h = m5Candles[selectedIndex].high;
+   double l = m5Candles[selectedIndex].low;
+
+   double body = MathAbs(c - o);
+   double upperWick = h - MathMax(o, c);
+   double lowerWick = MathMin(o, c) - l;
+
+   bool isValid = false;
+
+   if(orderType == ORDER_TYPE_SELL)
+     {
+      bool isHammer = upperWick > body * 2;
+      bool isEngulfing = c < o && h >= m5Candles[selectedIndex + 1].high && l <= m5Candles[selectedIndex + 1].low;
+      isValid = isHammer || isEngulfing;
+     }
+   else
+      if(orderType == ORDER_TYPE_BUY)
+        {
+         bool isHammer = lowerWick > body * 2;
+         bool isEngulfing = c > o && h >= m5Candles[selectedIndex + 1].high && l <= m5Candles[selectedIndex + 1].low;
+         isValid = isHammer || isEngulfing;
+        }
+
+   if(isValid)
+     {
+      string label = (orderType == ORDER_TYPE_SELL) ? "SEDU_SELL_" : "SEDU_BUY_";
+      label += IntegerToString((int)TimeCurrent());
+      ENUM_OBJECT arrowType = (orderType == ORDER_TYPE_SELL) ? OBJ_ARROW_DOWN : OBJ_ARROW_UP;
+      double priceMark = (orderType == ORDER_TYPE_SELL) ? h : l;
+
+      ObjectCreate(0, label, arrowType, 0, m5Candles[selectedIndex].time, priceMark);
+      ObjectSetInteger(0, label, OBJPROP_COLOR, (orderType == ORDER_TYPE_SELL) ? clrRed : clrGreen);
+      ObjectSetInteger(0, label, OBJPROP_WIDTH, 2);
+
+      double entryPrice = m5Candles[selectedIndex].close;
+      double stopLoss   = (orderType==ORDER_TYPE_SELL) ?
+                          m5Candles[selectedIndex].high :
+                          m5Candles[selectedIndex].low; // mecha
+
+      // Calculamos el lotaje con el nuevo SL/Entry
+      double lots = CalculateLotSize(entryPrice, stopLoss);
+      if(lots <= 0)
+        {
+         Print("[WARN] LotSize calculado <= 0, cancelando orden.");
+         return;
+        }
+
+      // Calculamos TP según el RR
+      double distance = MathAbs(entryPrice - stopLoss);
+      double takeProfit = (orderType==ORDER_TYPE_SELL) ?
+                          entryPrice - distance*RiskRewardRatio :
+                          entryPrice + distance*RiskRewardRatio;
+
+      // Ejecutamos orden con valores fijos
+      if(orderType == ORDER_TYPE_SELL)
+         trade.Sell(lots, _Symbol, entryPrice, stopLoss, takeProfit, NULL);
+      else
+         trade.Buy(lots, _Symbol, entryPrice, stopLoss, takeProfit, NULL);
+
+      // Debug
+      PrintFormat("[DEBUG:ManualEntry] %s Entry=%.5f SL=%.5f TP=%.5f Lots=%.2f",
+                  orderType==ORDER_TYPE_BUY?"BUY":"SELL", entryPrice, stopLoss, takeProfit, lots);
+     }
+   else
+     {
+      Print("[INFO] La vela dominante no cumplió con criterios de entrada.");
+     }
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double entryPrice, double stopLossPrice)
+  {
+// 1. Balance y riesgo
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk = balance * RiskPercent / 100.0;
+
+// 2. Puntos de SL
+   double slPoints = MathAbs(entryPrice - stopLossPrice) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+// 3. Valor de pip/tick
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   if(slPoints < 1e-3 || tickValue <= 0.0 || tickSize <= 0.0)
+     {
+      Print("[ERROR] No se pudo calcular el lotaje: parámetros inválidos");
+      return(0);
+     }
+
+// 4. Cálculo
+   double lotSize = risk / (slPoints * tickValue * (tickSize/SymbolInfoDouble(_Symbol, SYMBOL_POINT)));
+
+// 5. Limitar a min/max y step
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lotSize = MathMax(minLot, MathMin(lotSize, maxLot));
+   lotSize = NormalizeDouble(lotSize/lotStep, 0) * lotStep;
+   return NormalizeDouble(lotSize, 2);
+  }
+
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double GetMinStopDistance()
+  {
+   double pts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   return MathMax(1.0, pts) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  }
+
+// Llamar desde CheckM5Confirmation en vez de trade.Buy/Sell directo:
+void SchedulePendingTrade(int type, double entry, double sl, double tp, double lots)
+  {
+   pendingOrder = true;
+   pendingType  = type;
+   pendingEntry = entry;
+   pendingSL    = sl;
+   pendingTP    = tp;
+   pendingLots  = lots;
+   PrintFormat("[INFO] Orden pendiente programada: %s Entry=%.5f SL=%.5f TP=%.5f Lots=%.2f",
+               (type==ORDER_TYPE_BUY?"BUY":"SELL"),
+               entry, sl, tp, lots);
+//}
+
+// En OnTick(), justo al principio:
+   if(pendingOrder)
+     {
+      OpenTradePrecise(pendingType, pendingEntry, pendingSL, pendingTP, pendingLots);
+      pendingOrder = false;
+     }
+  }
+
+// 5bis. Función única para abrir trade con todos los parámetros ya validados
+void OpenTradePrecise(int type, double entry, double sl, double tp, double lots)
+  {
+// 5.1 Validación de stops mínimos
+   double minDist = GetMinStopDistance();
+   double actualDist = MathAbs(entry - sl);
+   PrintFormat("[DEBUG] Validando stops → Dist=%.5f MinDist=%.5f", actualDist, minDist);
+   if(actualDist < minDist)
+     {
+      PrintFormat("[ERROR] Stop demasiado cercano: Cancela orden %s",
+                  (type==ORDER_TYPE_BUY?"BUY":"SELL"));
+      return;
+     }
+
+// 5.2 Normalizar precios
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   entry = NormalizeDouble(entry, digits);
+   sl    = NormalizeDouble(sl,    digits);
+   tp    = NormalizeDouble(tp,    digits);
+
+// 5.3 Envío
+   if(type==ORDER_TYPE_BUY)
+      trade.Buy(lots, _Symbol, entry, sl, tp, NULL);
+   else
+      trade.Sell(lots, _Symbol, entry, sl, tp, NULL);
+
+   PrintFormat("[DEBUG:TradeExec] %s Entry=%.5f SL=%.5f TP=%.5f Lots=%.2f",
+               (type==ORDER_TYPE_BUY?"BUY":"SELL"),
+               entry, sl, tp, lots);
+  }
+
+//+------------------------------------------------------------------+
